@@ -4293,7 +4293,7 @@ function artBase(id, currentFloor) {
   const SAVE_FILE = "save.json";
 
   const Store = {
-    mode: window.kcNative ? "native" : ((typeof window.showDirectoryPicker === "function") ? "fs" : "ls"),
+    mode: window.kcNative ? "native" : (/^https?:$/.test(location.protocol) ? "server" : ((typeof window.showDirectoryPicker === "function") ? "fs" : "ls")),
     cache: Object.assign({}, SAVE_DEFAULT),
     root: null,
     dir: null,
@@ -4354,6 +4354,13 @@ function artBase(id, currentFloor) {
     },
 
     async flush() {
+      if (this.mode === "server") {
+        // сохранение на сервере по нику (ник задаётся в mp.js)
+        if (window.kcNick && window.kcServerPut) {
+          try { await window.kcServerPut(window.kcNick, this.cache); } catch (e) {}
+        }
+        return;
+      }
       if (this.mode === "native") {
         try { await window.kcNative.save(JSON.stringify(this.cache, null, 2)); } catch (e) {}
         return;
@@ -4376,6 +4383,13 @@ function artBase(id, currentFloor) {
     },
 
     async init() {
+      if (this.mode === "server") {
+        // данные придут, когда игрок введёт ник: mp.js вызовет kcStoreMerge
+        window.kcStoreMerge = d => { this.mergeIn(d); this.changed(); };
+        this.state = "ready";
+        this.changed();
+        return;
+      }
       if (this.mode === "native") {
         try { const s = await window.kcNative.load(); if (s) this.mergeIn(JSON.parse(s)); } catch (e) {}
         this.state = "ready";
@@ -4480,6 +4494,12 @@ function artBase(id, currentFloor) {
     let view = "main";
 
     function storageBlock() {
+      if (Store.mode === "server") {
+        const nk = window.kcNick
+          ? `💾 Сохранения на сервере, ник «${window.kcNick}» ✓`
+          : "💾 Введите ник, чтобы сохранения привязались к вам";
+        return `<div style="color:var(--dim);font-size:0.78rem;text-align:left;overflow-wrap:anywhere;">${nk}</div>`;
+      }
       if (Store.mode === "native") {
         return `<div style="color:var(--dim);font-size:0.78rem;text-align:left;overflow-wrap:anywhere;">💾 Сохранения: папка «${SAVE_DIR}» рядом с игрой ✓</div>`;
       }

@@ -8,7 +8,8 @@
     ws: null, code: null, role: null, peer: false, inRoom: false,
     remote: false, applying: false, lastSent: "",
     peerScene: null, peerRoom: null, peerHide: false,
-    caughtFor: null, morningDone: false
+    caughtFor: null, morningDone: false,
+    nick: null, peerNick: null
   };
   const $m = id => document.getElementById(id);
   const C = () => window.Ch2;
@@ -78,7 +79,8 @@
     if (m.t === "peer") {
       if (m.state === "joined") {
         MP.peer = true;
-        setStatus("Второй игрок подключён", "#9be89b");
+        MP.peerNick = m.nick || null;
+        setStatus((MP.peerNick ? "Игрок «" + MP.peerNick + "» подключился" : "Второй игрок подключён"), "#9be89b");
       } else if (m.state === "left") {
         MP.peer = false;
         MP.inRoom = false;
@@ -372,7 +374,7 @@
   function updateBtn() {
     const b = $m("mpBtn");
     if (!b) return;
-    b.textContent = MP.inRoom ? "🌐 Комната " + MP.code : "🌐 Онлайн";
+    b.textContent = MP.inRoom ? "🌐 Комната " + MP.code : "🌐 " + (MP.nick || "Онлайн");
     b.style.borderColor = MP.inRoom ? "#e62929" : "";
   }
 
@@ -403,6 +405,7 @@
       <div id="mpRoomBox" style="display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center"></div>
       <div id="mpStatus" class="menu-sub" style="min-height:1.2em"></div>
       <div class="menu-btns" id="mpBtns">
+        <button class="ovb" id="mpNick">Сменить ник${MP.nick ? " (" + MP.nick + ")" : ""}</button>
         <button class="ovb" id="mpCreate">Создать комнату</button>
         <input id="mpCode" maxlength="4" placeholder="Код комнаты" style="font:inherit;text-align:center;letter-spacing:4px;text-transform:uppercase;padding:8px;background:#181a1f;color:var(--ink);border:1px solid #383b42;border-radius:5px;">
         <button class="ovb" id="mpJoin">Войти по коду</button>
@@ -415,7 +418,7 @@
       if (window.Sfx) Sfx.click();
       if (MP.inRoom) return;
       setStatus("Создаём комнату...");
-      connect(() => sendMsg({ t: "create" }));
+      connect(() => sendMsg({ t: "create", nick: MP.nick }));
     };
     ov.querySelector("#mpJoin").onclick = () => {
       if (window.Sfx) Sfx.click();
@@ -423,7 +426,7 @@
       if (code.length !== 4) return setStatus("Код состоит из 4 символов", "#ffb3b3");
       if (MP.inRoom) return setStatus("Сначала выйдите из текущей комнаты", "#ffb3b3");
       setStatus("Подключаемся...");
-      connect(() => sendMsg({ t: "join", code }));
+      connect(() => sendMsg({ t: "join", code, nick: MP.nick }));
     };
     ov.querySelector("#mpLeave").onclick = () => {
       if (MP.ws) MP.ws.close();
@@ -437,6 +440,7 @@
       setStatus("Вы вышли из комнаты");
       updateBtn();
     };
+    ov.querySelector("#mpNick").onclick = () => askNick(true);
     ov.querySelector("#mpClose").onclick = () => ov.remove();
     renderRoomBox();
     if (MP.inRoom) setStatus(MP.peer ? "Второй игрок подключён" : "Ждём второго игрока...", MP.peer ? "#9be89b" : "");
@@ -459,6 +463,74 @@
     updateBtn();
   }
 
+  /* ---------- Ник и сохранения на сервере ---------- */
+  const NICK_RE = /^[\p{L}\p{N}_\- ]{2,16}$/u;
+  try { MP.nick = localStorage.getItem("kcNick"); } catch (e) {}
+  window.kcNick = MP.nick;
+
+  // Сохранение уходит на сервер под ником (см. Store.flush в index.html)
+  window.kcServerPut = (nick, data) => fetch("/api/save?nick=" + encodeURIComponent(nick), {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data)
+  });
+
+  function loadSaveFor(nick) {
+    fetch("/api/save?nick=" + encodeURIComponent(nick))
+      .then(r => r.json())
+      .then(d => { if (window.kcStoreMerge) window.kcStoreMerge(d); })
+      .catch(() => {});
+  }
+
+  function askNick(isChange) {
+    if (document.querySelector(".game .nick-ov")) return;
+    const ov = document.createElement("div");
+    ov.className = "ov nick-ov";
+    ov.style.zIndex = isChange ? 96 : 58;
+    ov.style.animation = "none";
+    ov.innerHTML = `
+      <div class="menu-title" style="font-size:2rem">${isChange ? "Сменить ник" : "Введите ник"}</div>
+      <div class="menu-sub">По нику сохраняется ваш прогресс. Второй игрок увидит ваш ник в кооп-комнате.</div>
+      <input id="nickIn" maxlength="16" value="${MP.nick || ""}" placeholder="2–16 символов" style="font:inherit;text-align:center;padding:8px;width:min(260px,80%);background:#181a1f;color:var(--ink);border:1px solid #383b42;border-radius:5px;">
+      <div id="nickErr" style="color:#ffb3b3;font-size:0.85rem;min-height:1.2em"></div>
+      <div class="menu-btns">
+        <button class="ovb" id="nickOk">${isChange ? "Сохранить" : "Продолжить"}</button>
+        ${isChange ? '<button class="ovb" id="nickCancel">Отмена</button>' : ""}
+      </div>`;
+    document.querySelector(".game").appendChild(ov);
+
+    const input = ov.querySelector("#nickIn");
+    const err = ov.querySelector("#nickErr");
+    const ok = () => {
+      const n = input.value.trim().replace(/\s+/g, " ");
+      if (!NICK_RE.test(n)) {
+        err.textContent = "Ник: 2–16 символов, буквы, цифры, _ и -";
+        return;
+      }
+      if (window.Sfx) Sfx.click();
+      const prev = MP.nick;
+      try { localStorage.setItem("kcNick", n); } catch (e) {}
+      MP.nick = n;
+      window.kcNick = n;
+      ov.remove();
+      // Смена на другой ник перезагружает страницу, чтобы прогресс двух игроков не смешался
+      if (prev && prev !== n) { location.reload(); return; }
+      loadSaveFor(n);
+      updateBtn();
+    };
+    ov.querySelector("#nickOk").onclick = ok;
+    input.onkeydown = e => { if (e.key === "Enter") ok(); };
+    input.focus();
+    const cancel = ov.querySelector("#nickCancel");
+    if (cancel) cancel.onclick = () => ov.remove();
+  }
+
   addButton();
   setupCh2();
+
+  // Ник спрашиваем только на сервере: при открытии файлом сохранения локальные
+  if (/^https?:$/.test(location.protocol)) {
+    if (MP.nick) loadSaveFor(MP.nick);
+    else setTimeout(() => askNick(false), 300);
+  }
 })();
