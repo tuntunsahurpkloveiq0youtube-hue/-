@@ -1,9 +1,23 @@
-/* Кооператив для «Красные цифры»: 2 игрока, синхронизация переходов между сценами
-   главы 1 и позиции второго игрока. Глава 2 в этой версии идёт локально. */
+/* Кооператив для «Красные цифры»: 2 игрока.
+   Глава 1: синхронизация переходов между сценами и позиции второго игрока.
+   Глава 2: хост ведёт мир (фазы, таймеры, монстр, двери, улики), гость присылает
+   свои действия и получает снимок мира. Каждый видит второго игрока в квартире. */
 (function () {
   const SVGNS = "http://www.w3.org/2000/svg";
-  const MP = { ws: null, code: null, role: null, peer: false, remote: false, lastSent: "" };
+  const MP = {
+    ws: null, code: null, role: null, peer: false, inRoom: false,
+    remote: false, applying: false, lastSent: "",
+    peerScene: null, peerRoom: null, peerHide: false,
+    caughtFor: null, morningDone: false
+  };
   const $m = id => document.getElementById(id);
+  const C = () => window.Ch2;
+  const ROOM_NAMES = { corridor: "Коридор", living: "Гостиная", kitchen: "Кухня", bedroom: "Комната", bathroom: "Ванная" };
+
+  function coop() { return MP.inRoom && MP.peer && !!C(); }
+  function isGuest() { return MP.role === "guest"; }
+  // Гость не ведёт фазы сам: он просит хоста, а применяет только снимок
+  function guestOnly() { return coop() && isGuest() && !MP.applying; }
 
   function wsUrl() {
     return (location.protocol === "https:" ? "wss" : "ws") + "://" + location.host + "/ws";
@@ -33,6 +47,8 @@
       MP.peer = false;
       MP.code = null;
       MP.role = null;
+      MP.peerScene = null;
+      MP.peerRoom = null;
       hideGhost();
       if (MP.inRoom) setStatus("Соединение потеряно", "#ffb3b3");
       MP.inRoom = false;
@@ -51,7 +67,7 @@
       MP.code = m.code;
       MP.role = m.role;
       MP.inRoom = true;
-      renderRoom();
+      renderRoomBox();
       updateBtn();
       return;
     }
@@ -67,23 +83,26 @@
         MP.peer = false;
         MP.inRoom = false;
         MP.code = null;
+        MP.peerScene = null;
+        MP.peerRoom = null;
         hideGhost();
         setStatus("Второй игрок вышел, комната закрыта", "#ffb3b3");
         updateBtn();
       }
-      renderRoom();
+      renderRoomBox();
       return;
     }
-    if (m.t === "go") {
-      applyRemoteGo(m.n, m.d);
-      return;
-    }
-    if (m.t === "pos") {
-      showGhost(m);
+    if (m.t === "go") { applyRemoteGo(m.n, m.d); return; }
+    if (m.t === "pos") { showGhost(m); return; }
+    if (m.t === "c2s") { if (isGuest()) applySnapshot(m); return; }
+    if (m.t === "c2req") { if (MP.role === "host") hostRequest(m); return; }
+    if (m.t === "c2up") { if (MP.role === "host") hostMergeFound(m); return; }
+    if (m.t === "c2") {
+      if (m.op === "caught" && isGuest() && C() && C().active) C().caughtByMonster();
     }
   }
 
-  // Переход, который пришёл от второго игрока
+  // Переход главы 1, который пришёл от второго игрока
   function applyRemoteGo(n, door) {
     if (!n) return;
     if (window._currentSceneId === n) return; // уже там, дубль от таймера
@@ -120,10 +139,17 @@
   }
 
   function showGhost(p) {
+    MP.peerScene = p.s || null;
+    MP.peerRoom = p.r || null;
+    MP.peerHide = !!p.h;
     const g = ensureGhost();
     if (!g) return;
-    const cur = window._currentSceneId;
-    if (!MP.peer || !p.s || p.s !== cur || (window.Ch2 && window.Ch2.active)) {
+    const c = C();
+    const inCh2 = !!(c && c.active);
+    let visible;
+    if (inCh2) visible = p.s === "ch2" && p.r === c.room && !p.h;
+    else visible = !!p.s && p.s === window._currentSceneId;
+    if (!MP.peer || !visible) {
       g.style.display = "none";
       return;
     }
@@ -142,20 +168,30 @@
 
   // Отправляем свою позицию раз в 100 мс, только если она изменилась
   setInterval(() => {
-    if (!MP.peer || !window.Walk || Walk.hidden || (window.Ch2 && Ch2.active)) return;
-    const s = window._currentSceneId;
+    if (!MP.peer || !window.Walk || Walk.hidden) return;
+    const c = C();
+    const inCh2 = !!(c && c.active);
+    const s = inCh2 ? "ch2" : window._currentSceneId;
     if (!s) return;
-    const payload = { t: "pos", s, x: Math.round(Walk.x * 10) / 10, y: Math.round(Walk.y * 10) / 10, f: Walk.face };
+    const payload = {
+      t: "pos", s,
+      r: inCh2 ? c.room : null,
+      h: inCh2 && c.hiding ? 1 : 0,
+      x: Math.round(Walk.x * 10) / 10,
+      y: Math.round(Walk.y * 10) / 10,
+      f: Walk.face
+    };
     const key = JSON.stringify(payload);
     if (key === MP.lastSent) return;
     MP.lastSent = key;
     sendMsg(payload);
   }, 100);
 
-  /* ---------- Перехват переходов: go() шлёт собеседнику ---------- */
+  /* ---------- Перехват переходов главы 1 ---------- */
   const origGo = window.go;
   window.go = function (n) {
-    if (!MP.remote && MP.peer && n && n !== "menu") {
+    const inCh2 = !!(C() && C().active);
+    if (!MP.remote && MP.peer && !inCh2 && n && n !== "menu") {
       sendMsg({ t: "go", n, d: window._doorNum });
     }
     return origGo.apply(this, arguments);
@@ -170,6 +206,168 @@
     return origShow.apply(this, arguments);
   };
 
+  /* ================= Глава 2: синхронизация ================= */
+  // Оригинальные методы запоминаем до подмены
+  let orig = null;
+
+  function hostPhase(p) {
+    const c = C();
+    if (!c.active) return c.start(p);
+    if (p === c.phase) return;
+    if (/^loop[1-4]$/.test(p)) return c.setupLoop(+p.slice(4));
+    if (p === "hunt") return c.startHunt();
+    if (p === "epilogue") return c.startEpilogue();
+    if (p === "intro") return c.start("intro");
+    if (p === "morning") {
+      if (c.phase === "epilogue" && c.step === "dad_home") c.sleepToMorning();
+    }
+  }
+
+  // Хост выполняет запросы гостя
+  function hostRequest(m) {
+    const c = C();
+    if (!c) return;
+    if (m.op === "phase") {
+      MP.morningDone = false;
+      hostPhase(m.p);
+      return;
+    }
+    if (m.op === "door" && m.id) {
+      c.doors[m.id] = true;
+      c.renderRoom();
+    }
+  }
+
+  // Улики гостя: добавляем только для текущей фазы хоста
+  function hostMergeFound(m) {
+    const c = C();
+    if (!c || !m.found) return;
+    const prefix = c.phase + ":";
+    Object.keys(m.found).forEach(k => {
+      if (m.found[k] && k.indexOf(prefix) === 0) c.found[k] = true;
+    });
+  }
+
+  // Гость получает снимок мира от хоста и подстраивает свою копию
+  function applySnapshot(s) {
+    const c = C();
+    if (!c || !s.active) return;
+    MP.applying = true;
+    try {
+      if (!c.active || s.ph !== c.phase) {
+        if (s.ph === "intro") orig.start.call(c, "intro");
+        else if (/^loop[1-4]$/.test(s.ph)) orig.setupLoop.call(c, +s.ph.slice(4));
+        else if (s.ph === "hunt") {
+          orig.startHunt.call(c);
+          // таймеры хода ведёт хост, локальные не нужны
+          clearInterval(c.huntTimer);
+          clearInterval(c.monsterTick);
+          c.huntTimer = c.monsterTick = null;
+        } else if (s.ph === "epilogue") orig.startEpilogue.call(c);
+      }
+
+      if (s.ph === "epilogue") {
+        if (s.step === "morning" && c.step !== "morning" && !MP.morningDone) {
+          MP.morningDone = true;
+          orig.sleepToMorning.call(c);
+        } else if (s.step !== "morning") {
+          c.step = s.step;
+        }
+      }
+
+      c.time = s.time;
+      c.doors = s.doors || {};
+      if (s.doorsOpen) c.doorsOpen = s.doorsOpen;
+      if (s.found) Object.keys(s.found).forEach(k => { if (s.found[k]) c.found[k] = true; });
+      c.monster = s.monster || c.monster;
+      c.huntSecondsLeft = s.hunt;
+      c.poltergeistItems = s.polt;
+      c.setTime(s.time, false);
+
+      if (c.phase === "hunt" && c.monster) {
+        Walk.setTask(
+          `ПРЯЧЬСЯ! Монстр: ${ROOM_NAMES[c.monster.room] || "квартира"}, ещё ${c.monster.left}с • До развязки: ${Math.max(0, c.huntSecondsLeft)}с`,
+          true
+        );
+      }
+    } catch (e) {
+      // снимок не применился: ждём следующий
+    } finally {
+      MP.applying = false;
+    }
+    c.renderRoom();
+  }
+
+  function setupCh2() {
+    const c = C();
+    if (!c || orig) return;
+    orig = {
+      start: c.start,
+      setupLoop: c.setupLoop,
+      startHunt: c.startHunt,
+      startEpilogue: c.startEpilogue,
+      sleepToMorning: c.sleepToMorning,
+      openDoor: c.openDoor
+    };
+
+    c.start = function (phase) {
+      if (guestOnly()) return sendMsg({ t: "c2req", op: "phase", p: phase || "intro" });
+      return orig.start.apply(this, arguments);
+    };
+    c.setupLoop = function (n) {
+      if (guestOnly()) return sendMsg({ t: "c2req", op: "phase", p: "loop" + n });
+      return orig.setupLoop.apply(this, arguments);
+    };
+    c.startHunt = function () {
+      if (guestOnly()) return sendMsg({ t: "c2req", op: "phase", p: "hunt" });
+      return orig.startHunt.apply(this, arguments);
+    };
+    c.startEpilogue = function () {
+      if (guestOnly()) return sendMsg({ t: "c2req", op: "phase", p: "epilogue" });
+      return orig.startEpilogue.apply(this, arguments);
+    };
+    c.sleepToMorning = function () {
+      if (guestOnly()) return sendMsg({ t: "c2req", op: "phase", p: "morning" });
+      return orig.sleepToMorning.apply(this, arguments);
+    };
+    c.openDoor = function (id) {
+      const before = this.doors[id];
+      const r = orig.openDoor.apply(this, arguments);
+      if (coop() && isGuest() && !MP.applying && this.doors[id] && !before) {
+        sendMsg({ t: "c2req", op: "door", id });
+      }
+      return r;
+    };
+
+    // Хост рассылает снимок мира и следит, не настиг ли монстр гостя
+    setInterval(() => {
+      const cc = C();
+      if (!cc || !coop() || MP.role !== "host" || !cc.active) return;
+      sendMsg({
+        t: "c2s", active: true, ph: cc.phase, step: cc.step, time: cc.time,
+        doors: cc.doors, doorsOpen: cc.doorsOpen, found: cc.found,
+        monster: cc.monster, hunt: cc.huntSecondsLeft, polt: cc.poltergeistItems
+      });
+      const inMonsterRoom = cc.phase === "hunt" && cc.monster && MP.peerScene === "ch2"
+        && MP.peerRoom === cc.monster.room && !MP.peerHide;
+      if (inMonsterRoom) {
+        if (MP.caughtFor !== cc.monster.room) {
+          MP.caughtFor = cc.monster.room;
+          sendMsg({ t: "c2", op: "caught" });
+        }
+      } else if (MP.caughtFor && (!cc.monster || MP.caughtFor !== cc.monster.room)) {
+        MP.caughtFor = null;
+      }
+    }, 400);
+
+    // Гость присылает найденные улики хосту
+    setInterval(() => {
+      const cc = C();
+      if (!cc || !cc.active || !coop() || !isGuest()) return;
+      sendMsg({ t: "c2up", found: cc.found });
+    }, 400);
+  }
+
   /* ---------- Интерфейс: кнопка и панель ---------- */
   function updateBtn() {
     const b = $m("mpBtn");
@@ -178,7 +376,7 @@
     b.style.borderColor = MP.inRoom ? "#e62929" : "";
   }
 
-  function renderRoom() {
+  function renderRoomBox() {
     const box = $m("mpRoomBox");
     if (!box) return;
     if (!MP.inRoom) {
@@ -189,8 +387,7 @@
       <div style="font-size:0.9rem;color:var(--dim)">Код комнаты (передай другу):</div>
       <div style="font-family:monospace;font-size:2rem;letter-spacing:6px;color:#fff">${MP.code}</div>
       <div style="font-size:0.82rem;color:var(--dim);max-width:300px">
-        Кооп-режим синхронизирует переходы между комнатами и показывает второго игрока.
-        Глава 2 пока проходится в каждой копии отдельно.
+        Кооп-режим: главы 1 и 2 синхронизированы, второй игрок виден в квартире.
       </div>`;
     if (MP.role === "host" && !MP.peer) setStatus("Ждём второго игрока...");
   }
@@ -214,12 +411,11 @@
       </div>`;
     document.querySelector(".game").appendChild(ov);
 
-    const create = () => connect(() => sendMsg({ t: "create" }));
     ov.querySelector("#mpCreate").onclick = () => {
       if (window.Sfx) Sfx.click();
       if (MP.inRoom) return;
       setStatus("Создаём комнату...");
-      create();
+      connect(() => sendMsg({ t: "create" }));
     };
     ov.querySelector("#mpJoin").onclick = () => {
       if (window.Sfx) Sfx.click();
@@ -234,13 +430,15 @@
       MP.inRoom = false;
       MP.peer = false;
       MP.code = null;
+      MP.peerScene = null;
+      MP.peerRoom = null;
       hideGhost();
-      renderRoom();
+      renderRoomBox();
       setStatus("Вы вышли из комнаты");
       updateBtn();
     };
     ov.querySelector("#mpClose").onclick = () => ov.remove();
-    renderRoom();
+    renderRoomBox();
     if (MP.inRoom) setStatus(MP.peer ? "Второй игрок подключён" : "Ждём второго игрока...", MP.peer ? "#9be89b" : "");
   }
 
@@ -262,4 +460,5 @@
   }
 
   addButton();
+  setupCh2();
 })();
